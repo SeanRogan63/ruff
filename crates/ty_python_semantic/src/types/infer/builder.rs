@@ -5212,7 +5212,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     },
                 ) => {
                     let mut expected_fields = FxHashMap::default();
-                    let mut required_fields = FxHashSet::default();
                     for (overload, binding) in &overloads_with_binding {
                         let argument_index = if binding.bound_type.is_some() {
                             argument_index + 1
@@ -5233,9 +5232,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                             if let Some(name) = parameter.keyword_name() {
                                 let annotated_type = parameter.annotated_type();
-                                if parameter.default_type().is_none() {
-                                    required_fields.insert(name.clone());
-                                }
                                 expected_fields
                                     .entry(name.clone())
                                     .and_modify(|existing| {
@@ -5255,7 +5251,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             self.expression_type(value),
                             keyword,
                             Some(&expected_fields),
-                            Some(&required_fields),
                         )
                     {
                         argument_types.insert(TypeContext::default(), ty);
@@ -7063,7 +7058,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         argument_type: Type<'db>,
         keyword: &ast::Keyword,
         expected_fields: Option<&FxHashMap<Name, Type<'db>>>,
-        required_fields: Option<&FxHashSet<Name>>,
     ) -> Option<Type<'db>> {
         let db = self.db();
         let file_scope_id = self.scope().file_scope_id(db);
@@ -7087,14 +7081,15 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             let Some(key) = self.kwargs_definition_key(first_definition) else {
                 continue;
             };
-            let contextual_definition = if expected_fields.is_some() {
+            let contextual_ty = expected_fields.and_then(|expected_fields| {
                 bindings
                     .filter_map(|binding| binding.binding.definition())
                     .exactly_one()
                     .ok()
-            } else {
-                None
-            };
+                    .and_then(|definition| {
+                        self.contextualized_kwargs_field_type(definition, &key, expected_fields)
+                    })
+            });
 
             if let Place::Defined(DefinedPlace {
                 ty,
@@ -7102,11 +7097,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 ..
             }) = place.place
             {
-                let field_ty = contextual_definition
-                    .and_then(|definition| {
-                        self.contextualized_kwargs_field_type(definition, &key, expected_fields)
-                    })
-                    .unwrap_or(ty);
+                let field_ty = contextual_ty.unwrap_or(ty);
                 elements.push((key, field_ty));
             }
         }
@@ -7129,14 +7120,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         .is_always_satisfied(db)
                 });
 
-        if has_valid_keyword_keys
-            && expected_fields.is_some()
-            && required_fields.is_some_and(|required| {
-                required
-                    .iter()
-                    .all(|expected| elements.iter().any(|(name, _)| name == expected))
-            })
-        {
+        if has_valid_keyword_keys && expected_fields.is_some() {
             let schema = elements
                 .iter()
                 .cloned()
@@ -7216,9 +7200,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         &mut self,
         definition: Definition<'db>,
         key: &Name,
-        expected_fields: Option<&FxHashMap<Name, Type<'db>>>,
+        expected_fields: &FxHashMap<Name, Type<'db>>,
     ) -> Option<Type<'db>> {
-        let expected_ty = expected_fields?.get(key).copied()?;
+        let expected_ty = expected_fields.get(key).copied()?;
         let DefinitionKind::DictKeyAssignment(assignment) = definition.kind(self.db()) else {
             return None;
         };
@@ -7242,7 +7226,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     self.store_expression_type(argument, ty);
                 } else if let ast::ArgOrKeyword::Keyword(keyword) = arg_or_keyword
                     && keyword.arg.is_none()
-                    && let Some(narrowed) = self.try_narrow_dict_kwargs(ty, keyword, None, None)
+                    && let Some(narrowed) = self.try_narrow_dict_kwargs(ty, keyword, None)
                 {
                     return narrowed;
                 }

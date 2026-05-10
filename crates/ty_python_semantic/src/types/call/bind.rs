@@ -5223,73 +5223,33 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         if let Some(unpacked_keys) =
             extract_unpacked_typed_dict_keys_from_value_type(self.db, argument_type)
         {
-            if let KeywordUnpackKeyTypeCheck::Invalid(provided_ty) =
-                validate_keyword_unpack_key_type(
-                    self.db,
+            let matched_parameters = &self.argument_matches[argument_index].parameters;
+            let keyword_variadic = matched_parameters.iter().copied().find(|parameter_index| {
+                self.signature.parameters()[*parameter_index].is_keyword_variadic()
+            });
+
+            for (name, unpacked_key) in &unpacked_keys {
+                let parameter_index = matched_parameters
+                    .iter()
+                    .copied()
+                    .find(|parameter_index| {
+                        let parameter = &self.signature.parameters()[*parameter_index];
+                        !parameter.is_keyword_variadic() && parameter.keyword_name() == Some(name)
+                    })
+                    .or(keyword_variadic);
+
+                let Some(parameter_index) = parameter_index else {
+                    continue;
+                };
+
+                self.check_argument_type(
                     constraints,
-                    argument_type,
-                    self.inferable_typevars,
-                )
-            {
-                self.errors.push(BindingError::InvalidKeyType {
-                    argument_index: adjusted_argument_index,
-                    provided_ty,
-                });
-            }
-
-            let matched_parameters = self.argument_matches[argument_index]
-                .parameters
-                .iter()
-                .copied()
-                .collect::<Vec<_>>();
-            let matched_keyword_names = matched_parameters
-                .iter()
-                .filter_map(|parameter_index| {
-                    let parameter = &self.signature.parameters()[*parameter_index];
-                    if parameter.is_keyword_variadic() {
-                        None
-                    } else {
-                        parameter.keyword_name().cloned()
-                    }
-                })
-                .collect::<Vec<_>>();
-            let mut checked_keyword_variadic = false;
-
-            for parameter_index in matched_parameters {
-                let parameter = &self.signature.parameters()[parameter_index];
-
-                if parameter.is_keyword_variadic() {
-                    if checked_keyword_variadic {
-                        continue;
-                    }
-                    checked_keyword_variadic = true;
-
-                    for (name, unpacked_key) in &unpacked_keys {
-                        if matched_keyword_names.contains(name) {
-                            continue;
-                        }
-
-                        self.check_argument_type(
-                            constraints,
-                            argument_index,
-                            adjusted_argument_index,
-                            argument,
-                            unpacked_key.value_ty,
-                            parameter_index,
-                        );
-                    }
-                } else if let Some(name) = parameter.keyword_name()
-                    && let Some(unpacked_key) = unpacked_keys.get(name)
-                {
-                    self.check_argument_type(
-                        constraints,
-                        argument_index,
-                        adjusted_argument_index,
-                        argument,
-                        unpacked_key.value_ty,
-                        parameter_index,
-                    );
-                }
+                    argument_index,
+                    adjusted_argument_index,
+                    argument,
+                    unpacked_key.value_ty,
+                    parameter_index,
+                );
             }
 
             return;
