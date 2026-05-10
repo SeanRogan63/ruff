@@ -3326,17 +3326,7 @@ impl<'db> CallableBinding<'db> {
                     .argument_matches
                     .iter()
                     .zip(arguments.iter())
-                    .flat_map(move |(matched_argument, (argument, argument_types))| {
-                        let keyword_context = if matches!(argument, Argument::Keywords) {
-                            Some(keyword_argument_context(
-                                overload.signature.parameters(),
-                                matched_argument,
-                            ))
-                            .filter(|context| !context.is_empty())
-                        } else {
-                            None
-                        };
-
+                    .flat_map(move |(matched_argument, (_, argument_types))| {
                         matched_argument.iter().map(
                             move |(parameter_index, variadic_argument_type)| {
                                 // TODO: For an unannotated `self` / `cls` parameter, the type should be
@@ -3347,25 +3337,10 @@ impl<'db> CallableBinding<'db> {
                                     .apply_optional_specialization(db, overload.specialization);
                                 let argument_type =
                                     argument_types.get_for_declared_type(parameter_type);
-                                let variadic_argument = if matches!(argument, Argument::Keywords) {
-                                    keyword_context
-                                        .as_deref()
-                                        .and_then(|context| {
-                                            keyword_context_field_type(
-                                                overload.signature.parameters(),
-                                                argument_types,
-                                                context,
-                                                parameter_index,
-                                            )
-                                        })
-                                        .or(variadic_argument_type)
-                                } else {
-                                    variadic_argument_type
-                                };
                                 OverloadFilterSlot {
                                     parameter: parameter_type,
                                     argument: argument_type,
-                                    variadic_argument,
+                                    variadic_argument: variadic_argument_type,
                                 }
                             },
                         )
@@ -4861,19 +4836,9 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         let mut assignable_to_declared_type = true;
 
         let parameters = self.signature.parameters();
-        for (argument_index, adjusted_argument_index, argument, argument_types) in
+        for (argument_index, adjusted_argument_index, _, argument_types) in
             self.enumerate_argument_types()
         {
-            let keyword_context = if matches!(argument, Argument::Keywords) {
-                Some(keyword_argument_context(
-                    self.signature.parameters(),
-                    &self.argument_matches[argument_index],
-                ))
-                .filter(|context| !context.is_empty())
-            } else {
-                None
-            };
-
             for (parameter_index, variadic_argument_type) in
                 self.argument_matches[argument_index].iter()
             {
@@ -4883,22 +4848,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
 
                 let declared_type = parameters[parameter_index].annotated_type();
                 let argument_type = argument_types.get_for_declared_type(declared_type);
-                let inferred_argument_type = if matches!(argument, Argument::Keywords) {
-                    keyword_context
-                        .as_deref()
-                        .and_then(|context| {
-                            keyword_context_field_type(
-                                parameters,
-                                argument_types,
-                                context,
-                                parameter_index,
-                            )
-                        })
-                        .or(variadic_argument_type)
-                        .unwrap_or(argument_type)
-                } else {
-                    variadic_argument_type.unwrap_or(argument_type)
-                };
+                let inferred_argument_type = variadic_argument_type.unwrap_or(argument_type);
 
                 let specialization_result = builder.infer_map(
                     declared_type,
