@@ -385,7 +385,7 @@ Class decorators can also replace the class object with an instance:
 
 ```py
 from dataclasses import dataclass
-from typing import Generic, Protocol, TypeVar, overload
+from typing import Callable, Generic, Protocol, TypeVar, overload
 from typing_extensions import Self
 
 T = TypeVar("T")
@@ -428,6 +428,19 @@ class WrappedThenDataclass:
     value: int
 
 reveal_type(WrappedThenDataclass)  # revealed: Unknown
+
+def int_decorator_factory() -> Callable[[type[object]], int]:
+    def decorator(cls: type[object]) -> int:
+        return 1
+    return decorator
+
+# error: [no-matching-overload]
+@dataclass
+@int_decorator_factory()
+class IntThenDataclass:
+    value: int
+
+reveal_type(IntThenDataclass)  # revealed: Unknown
 
 @WrapBackend
 class InvalidWrappedBase(1): ...  # error: [invalid-base]

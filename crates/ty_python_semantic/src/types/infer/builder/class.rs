@@ -80,6 +80,23 @@ fn is_unknown_decorator_result<'db>(db: &'db dyn crate::Db, ty: Type<'db>) -> bo
         .is_some_and(|dynamic| Type::Dynamic(dynamic).is_unknown())
 }
 
+fn class_decorator_return_type<'db>(
+    db: &'db dyn crate::Db,
+    decorator_ty: Type<'db>,
+    decorated_ty: Type<'db>,
+) -> Type<'db> {
+    let call_arguments = CallArguments::positional([decorated_ty]);
+    let return_ty = decorator_ty.try_call(db, &call_arguments).map_or_else(
+        |error| error.return_type(db),
+        |bindings| bindings.return_type(db),
+    );
+
+    match return_ty {
+        Type::DataclassDecorator(_) | Type::DataclassTransformer(_) => Type::unknown(),
+        return_ty => return_ty,
+    }
+}
+
 fn class_decorator_known_preservation<'db>(
     db: &'db dyn crate::Db,
     decorator_ty: Type<'db>,
@@ -181,6 +198,22 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             .iter()
             .map(|decorator| (self.infer_decorator(decorator), decorator))
             .collect();
+
+        let body_scope = self
+            .index
+            .node_scope(NodeWithScopeRef::Class(class_node))
+            .to_scope_id(db, self.file());
+
+        let maybe_known_class = KnownClass::try_from_file_and_name(db, self.file(), name);
+
+        let known_module = || file_to_module(db, self.file()).and_then(|module| module.known(db));
+        let in_typing_module = || {
+            matches!(
+                known_module(),
+                Some(KnownModule::Typing | KnownModule::TypingExtensions)
+            )
+        };
+
         let mut decorators_to_apply = Vec::with_capacity(decorator_types_and_nodes.len());
         let mut metadata_applies_to_original_class = true;
         let mut deprecated = None;
@@ -188,6 +221,32 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         let mut dataclass_params = None;
         let mut dataclass_transformer_params = None;
         let mut total_ordering = false;
+        let original_class_ty = |deprecated,
+                                 type_check_only,
+                                 dataclass_params,
+                                 dataclass_transformer_params,
+                                 total_ordering| {
+            match (maybe_known_class, &*name.id) {
+                (None, "NamedTuple") if in_typing_module() => {
+                    Type::SpecialForm(SpecialFormType::NamedTuple)
+                }
+                (None, "Any") if in_typing_module() => Type::SpecialForm(SpecialFormType::Any),
+                (None, "InitVar") if known_module() == Some(KnownModule::Dataclasses) => {
+                    Type::SpecialForm(SpecialFormType::TypeQualifier(TypeQualifier::InitVar))
+                }
+                _ => Type::from(StaticClassLiteral::new(
+                    db,
+                    name.id.clone(),
+                    body_scope,
+                    maybe_known_class,
+                    deprecated,
+                    type_check_only,
+                    dataclass_params,
+                    dataclass_transformer_params,
+                    total_ordering,
+                )),
+            }
+        };
         for &(decorator_ty, decorator) in decorator_types_and_nodes.iter().rev() {
             if metadata_applies_to_original_class {
                 if decorator_ty
@@ -273,13 +332,31 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     continue;
                 }
 
+                let current_original_class_ty = original_class_ty(
+                    deprecated,
+                    type_check_only,
+                    dataclass_params,
+                    dataclass_transformer_params,
+                    total_ordering,
+                );
+                let decorated_ty =
+                    class_decorator_return_type(db, decorator_ty, current_original_class_ty);
                 let decorator_preserves_unknown_result =
-                    class_decorator_known_preservation(db, decorator_ty).unwrap_or(false)
-                        || matches!(&decorator.expression, ast::Expr::Call(call) if {
-                            class_decorator_known_preservation(db, self.expression_type(&call.func))
-                                .unwrap_or(false)
-                        });
-                if !decorator_preserves_unknown_result {
+                    is_unknown_decorator_result(db, decorated_ty)
+                        && (can_preserve_unknown_class_decorator_result(db, decorator_ty)
+                            || matches!(&decorator.expression, ast::Expr::Call(call) if {
+                                can_preserve_unknown_class_decorator_result(
+                                    db,
+                                    self.expression_type(&call.func),
+                                )
+                            }));
+                if !(decorator_preserves_unknown_result
+                    || class_decorator_preserves_class_binding(
+                        db,
+                        current_original_class_ty,
+                        decorated_ty,
+                    ))
+                {
                     metadata_applies_to_original_class = false;
                 }
             }
@@ -287,41 +364,13 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             decorators_to_apply.push((decorator_ty, decorator));
         }
 
-        let body_scope = self
-            .index
-            .node_scope(NodeWithScopeRef::Class(class_node))
-            .to_scope_id(db, self.file());
-
-        let maybe_known_class = KnownClass::try_from_file_and_name(db, self.file(), name);
-
-        let known_module = || file_to_module(db, self.file()).and_then(|module| module.known(db));
-        let in_typing_module = || {
-            matches!(
-                known_module(),
-                Some(KnownModule::Typing | KnownModule::TypingExtensions)
-            )
-        };
-
-        let mut inferred_ty = match (maybe_known_class, &*name.id) {
-            (None, "NamedTuple") if in_typing_module() => {
-                Type::SpecialForm(SpecialFormType::NamedTuple)
-            }
-            (None, "Any") if in_typing_module() => Type::SpecialForm(SpecialFormType::Any),
-            (None, "InitVar") if known_module() == Some(KnownModule::Dataclasses) => {
-                Type::SpecialForm(SpecialFormType::TypeQualifier(TypeQualifier::InitVar))
-            }
-            _ => Type::from(StaticClassLiteral::new(
-                db,
-                name.id.clone(),
-                body_scope,
-                maybe_known_class,
-                deprecated,
-                type_check_only,
-                dataclass_params,
-                dataclass_transformer_params,
-                total_ordering,
-            )),
-        };
+        let mut inferred_ty = original_class_ty(
+            deprecated,
+            type_check_only,
+            dataclass_params,
+            dataclass_transformer_params,
+            total_ordering,
+        );
 
         let original_class_ty = inferred_ty;
         let mut class_ty_before_replacement = inferred_ty;
